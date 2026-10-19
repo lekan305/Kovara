@@ -86,31 +86,133 @@ The result is a uniform contract:
 | `400 LIMIT_EXCEEDED` | `limit` above the endpoint's maximum |
 | `400 INVALID_ID` | Non-numeric or negative resource id |
 | `400 INVALID_CURSOR` | Non-string or oversized pagination cursor |
+| `400 INVALID_CONTENT` | Post content missing, blank, over the 280-character limit, or not a string |
+| `400 INVALID_FIELD` | A profile field failed validation (currently `username`) |
+
+### Bounded free text (issue #921)
+
+`posts.content` is a plain `TEXT` column with no length constraint, so an
+oversized post is stored happily and only fails later — when a client renders
+it, or when a list endpoint serializes it. The bound is therefore applied at the
+API edge by `parsePostContent` in `src/api/validation.ts`:
+
+- The limit is **280 UTF-16 code units**, matching the cap the web client
+  enforces, so a post the UI accepts is never rejected by the API.
+- The **submitted value is measured verbatim**, not a trimmed copy. Content is
+  stored as submitted, so trimming before measuring would silently rewrite the
+  post and let padding slip past the limit.
+- Empty or whitespace-only content is `INVALID_CONTENT` rather than an empty
+  post row.
 
 ### Profiles
 
 | Method | Path | Notes |
 | --- | --- | --- |
 | GET | `/api/v1/profiles/:address` | Returns the profile object. |
+| PUT | `/api/v1/profiles/:address` | Updates `username` (required) and `creator_token` (optional). |
 
 - `400 INVALID_ADDRESS` — address missing/blank, or not a base-32 `G…` Stellar public key (see [Request validation](#request-validation-issue-665)).
 - `404 NOT_FOUND` — no profile for that address.
+- `400 INVALID_FIELD` — `username` missing, blank, or longer than 32 characters.
+- `400 INVALID_ADDRESS` — `creator_token` present but not a Stellar public key.
+
+**Profile updates are all-or-nothing (issue #923).** Every field is validated
+before anything is written and the handler issues at most one write, so a
+request carrying one bad field never applies the others. Validating field by
+field inside the write loop is precisely what produces partial updates: the
+profile ends up with the new username and the old creator token, with nothing in
+the response to say half the request was refused. Omitting `creator_token`
+leaves the stored value untouched rather than clearing it.
+
+**The response shape is stable (issue #926).** A profile always serializes with
+the same four keys, whatever the row happens to contain:
+
+| Key | Type | When unset |
+| --- | --- | --- |
+| `address` | string | never — it is the primary key |
+| `username` | string | `""` |
+| `creator_token` | string | `""` |
+| `updated_ledger` | integer | `0` |
+
+A row that has never had a `creator_token`, or that predates a column being
+added, comes back from Postgres with that property absent. Passing it straight
+through would drop the key entirely, so the same account serializes differently
+depending on which columns happen to be populated — and a client has to treat a
+missing key and an explicit value as two different things. Normalizing here
+means the keys are always present, so `'creator_token' in profile` and any
+generated type agree with the documented shape.
+
+**Address casing (issue #925).** A Stellar strkey is base-32 over `A–Z` and
+`2–7`, so **upper case is the canonical form**. `normalizeAddress` trims, folds
+to upper case and then validates the folded value, so every caller gets the same
+string back for the same account. Without this, a profile created from `gabc…`
+is not found again by a lookup for `GABC…` and a second row is created for the
+same account. Folding happens *before* validation so the character set is still
+checked exactly: `0`, `1`, `8` and `9` remain rejected in either case.
 
 ### Posts
 
 | Method | Path | Notes |
 | --- | --- | --- |
-| GET | `/api/v1/posts?author=<address>&limit=<n>&offset=<n>` | `author` optional; `limit` default 20, max 100; `offset` default 0. |
+| GET | `/api/v1/posts?author=<address>&limit=<n>&offset=<n>&cursor=<c>` | `author` optional; `limit` default 20, max 100; `offset` default 0. |
 | GET | `/api/v1/posts/:id` | `id` must be a non-negative integer. |
+| DELETE | `/api/v1/posts/:id` | Soft-deletes a post. See [deletion semantics](#post-deletion-semantics-issue-920). |
 
 List response:
 
 ```json
-{ "posts": [ … ], "total": 0, "limit": 20, "offset": 0, "has_more": false }
+{ "posts": [ … ], "total": 0, "limit": 20, "offset": 0, "has_more": false, "next_cursor": null }
 ```
 
 Errors: `400 INVALID_QUERY` (bad limit/offset), `400 LIMIT_EXCEEDED`,
-`400 INVALID_ADDRESS` (malformed `author`), `400 INVALID_ID`, `404 NOT_FOUND`.
+`400 INVALID_ADDRESS` (malformed `author`), `400 INVALID_ID`, `400 INVALID_CURSOR`,
+`404 NOT_FOUND`.
+
+#### Cursor pagination (issue #918)
+
+Two styles coexist, and the presence of `cursor` selects between them:
+
+- **No `cursor`** — the original `limit`/`offset` behaviour, unchanged, so
+  existing clients are unaffected. `next_cursor` is `null`.
+- **`cursor` present** — keyset pagination. `offset` is reported as `null` and
+  ignored, because mixing the two produces a page the caller cannot reason about.
+  `next_cursor` is the opaque boundary for the next request, and is `null` once a
+  short page comes back.
+
+Offset pagination cannot express a stable page: a post created *between* two
+page requests shifts every later row by one, so the client sees the row it
+already read and misses another. The cursor carries the boundary row's
+`(created_at, id)` pair and the query resumes with a row-value comparison strictly
+after it. Comparing on the pair rather than `created_at` alone is what makes the
+boundary unambiguous — many posts share a ledger timestamp, and a
+`created_at`-only comparison would drop or repeat all of them.
+
+The cursor is base64url-encoded but **not signed**, and carries no authority:
+the endpoint is public and read-only, and the payload is re-validated on the way
+back in (`created_at` must be a non-empty string, `id` must be numeric), so a
+tampered cursor is rejected rather than trusted. `total` stays the count of
+everything matching the filter — not of the remaining suffix — so it does not
+shrink on every page.
+
+A malformed cursor is a `400 INVALID_CURSOR`, not a silent restart from the first
+page: silently returning page one makes a client that lost its place loop over
+the same rows forever.
+
+#### Post deletion semantics (issue #920)
+
+`DELETE /posts/:id` soft-deletes a post. Deletion is a request for a desired end
+state — "this post is not visible" — not a transition that may only happen once,
+so the outcomes a client can observe are distinguished explicitly:
+
+| Outcome | Status | Body | Retry? |
+| --- | --- | --- | --- |
+| This call performed the deletion | `200` | `{ "id": "…", "deleted": true }` | — |
+| The post was already deleted | `200` | `{ "id": "…", "deleted": false }` | Safe; retrying is a no-op |
+| No such post ever existed | `404` | `{ "error": …, "code": "NOT_FOUND" }` | Pointless; do not retry |
+
+Telling "already deleted" apart from "never existed" is the whole point: the
+store matches on `deleted_at IS NULL`, so a blind `404` would be returned for
+both and an idempotent retry would look like a failure.
 
 ### Search
 
@@ -128,6 +230,15 @@ Errors: `400 INVALID_QUERY`, `400 QUERY_TOO_LONG`, `400 LIMIT_EXCEEDED`,
 `500 SEARCH_UNAVAILABLE`.
 
 ### Follows
+
+An account cannot follow itself. The rule is enforced in the **write path**
+(`handleFollow`), not only where a follow is read back, so a self-follow is
+refused with no database call and leaves no state behind (issue #930). A
+self-follow is a meaningless edge: it inflates both the follower and the
+following count of one account while the edge is invisible in either list,
+because a client filters `x !== self`. Comparing the *canonical* addresses means
+a contract emitting `GABC…` and an API caller sending `gabc…` cannot slip a
+self-follow past each other.
 
 | Method | Path | Notes |
 | --- | --- | --- |
